@@ -1,0 +1,150 @@
+name: Sync Affine
+
+on:
+  schedule:
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
+
+env:
+  UPSTREAM_IMAGE: ghcr.io/toeverything/affine
+  UPSTREAM_TAG: stable
+  MY_REGISTRY: ghcr.io
+  MY_IMAGE_NAME: ${{ github.repository_owner }}/affine
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # --- 第一步：检查更新并扫描匹配的 Tag ---
+      - name: Check for Updates
+        id: check
+        run: |
+          echo "Fetching upstream digest..."
+
+          # 1. 获取上游 stable 的 Digest
+          UPSTREAM_DIGEST=$(skopeo inspect docker://${{ env.UPSTREAM_IMAGE }}:${{ env.UPSTREAM_TAG }} --format '{{.Digest}}')
+          echo "Upstream Stable Digest: $UPSTREAM_DIGEST"
+
+          # 2. 检查我自己镜像的 Label 记录
+          LOCAL_LABEL=$(skopeo inspect docker://${{ env.MY_REGISTRY }}/${{ env.MY_IMAGE_NAME }}:stable --format '{{.Labels.upstream_digest}}' || echo "none")
+
+          # 3. 对比摘要
+          if [ "$UPSTREAM_DIGEST" == "$LOCAL_LABEL" ]; then
+            echo "::notice::Image is up to date."
+            echo "build=false" >> $GITHUB_OUTPUT
+            exit 0
+          else
+            echo "::notice::Update found ($UPSTREAM_DIGEST). Scanning for matching tags..."
+            echo "build=true" >> $GITHUB_OUTPUT
+            echo "digest=$UPSTREAM_DIGEST" >> $GITHUB_OUTPUT
+          fi
+
+          # 4. 获取上游所有 Tags 并过滤 (排除 canary, beta 和 stable 本身)
+          # grep -vE 'canary|beta|^stable$' : 排除包含canary/beta的tag, 以及精确匹配stable的tag
+          ALL_TAGS=$(skopeo list-tags docker://${{ env.UPSTREAM_IMAGE }} | jq -r '.Tags[]' | grep -vE 'canary|beta|^stable$')
+          
+          touch matched_tags.txt
+          
+          # 5. 高并发 (20线程) 检查哪些 Tag 的 Digest 与 stable 一致
+          if [ -n "$ALL_TAGS" ]; then
+            echo "$ALL_TAGS" | xargs -I {} -P 20 sh -c '
+              TAG="{}"
+              # 获取 Digest, 出错则忽略
+              DIGEST=$(skopeo inspect --format "{{.Digest}}" docker://${{ env.UPSTREAM_IMAGE }}:$TAG || echo "error")
+              
+              if [ "$DIGEST" = "'$UPSTREAM_DIGEST'" ]; then
+                 echo "$TAG" >> matched_tags.txt
+                 echo "Found match: $TAG"
+              fi
+            '
+          else
+            echo "No tags to scan after filtering."
+          fi
+          
+          # 6. 整理匹配结果
+          MATCHED=$(cat matched_tags.txt | sort | uniq)
+          MATCHED_ONE_LINE=$(echo "$MATCHED" | tr '\n' ' ')
+          
+          echo "Final matching tags to push: $MATCHED_ONE_LINE"
+          echo "match_tags=$MATCHED_ONE_LINE" >> $GITHUB_OUTPUT
+
+
+      - name: Setup Docker Buildx
+        if: steps.check.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install docker-squash
+        if: steps.check.outputs.build == 'true'
+        run: pip install docker-squash
+
+      # --- 第二步：准备构建环境 ---
+      - name: Prepare Build Context
+        if: steps.check.outputs.build == 'true'
+        run: |
+          # 1. 恢复补丁脚本
+          echo "${{ secrets.UPDATE_SCRIPT }}" > update.sh
+          chmod +x update.sh
+          
+          # 2. 恢复 Dockerfile
+          echo "${{ secrets.DOCKERFILE_CONTENT }}" > Dockerfile
+          
+          echo "Build context prepared. Dockerfile and update.sh hidden from logs."
+
+      # --- 第三步：构建镜像 ---
+      - name: Build Image
+        if: steps.check.outputs.build == 'true'
+        run: |
+          echo "Building Docker image..."
+          # 注意：我们在命令行中动态添加 LABEL，而不是写在 Dockerfile 里
+          # 这样可以保持 Dockerfile Secret 的静态性
+          # --label upstream_digest 注入 Digest 标记 (Metadata)
+          docker build \
+            --build-arg ORIGINAL_PUBLIC_KEY="${{ secrets.ORIGINAL_PUBLIC_KEY }}" \
+            --build-arg CUSTOM_PUBLIC_KEY="${{ secrets.CUSTOM_PUBLIC_KEY }}" \
+            --label upstream_digest="${{ steps.check.outputs.digest }}" \
+            -t temp-affine:latest .
+
+      - name: Squash and Push
+        if: steps.check.outputs.build == 'true'
+        run: |
+          echo "Starting Squash process..."
+          
+          # 1. 压缩最后 2 层
+          # Dockerfile 最后是 COPY 和 LABEL，我们将它们合并到基础镜像之上
+          # -f 2 : 保留所有之前的层，只压缩最后 2 层
+          docker-squash -f 2 -t ${{ env.MY_REGISTRY }}/${{ env.MY_IMAGE_NAME }}:stable temp-affine:latest
+          
+          # 2. 推送 stable
+          echo "Pushing stable..."
+          docker push ${{ env.MY_REGISTRY }}/${{ env.MY_IMAGE_NAME }}:stable
+          
+          # 3. 处理并推送其他匹配的 Tags (x.y.z, stable-{hash} 等)
+          MATCHED_TAGS="${{ steps.check.outputs.match_tags }}"
+          
+          for tag in $MATCHED_TAGS; do
+            # 忽略空值
+            if [ -z "$tag" ]; then continue; fi
+            
+            FULL_TAG="${{ env.MY_REGISTRY }}/${{ env.MY_IMAGE_NAME }}:$tag"
+            echo "Tagging and pushing: $FULL_TAG"
+            
+            # 为 Squash 后的镜像打上新 Tag
+            docker tag ${{ env.MY_REGISTRY }}/${{ env.MY_IMAGE_NAME }}:stable $FULL_TAG
+            docker push $FULL_TAG
+          done
+          
+          echo "All tags synced successfully."

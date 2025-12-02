@@ -1,0 +1,2 @@
+# AFFiNE
+SelfHosted AFFiNE

@@ -5,7 +5,7 @@ on:
     branches:
       - dev
   schedule:
-    - cron: '0 */2 * * *'
+    - cron: '0 */12 * * *'
   workflow_dispatch:
 
 env:
@@ -47,15 +47,20 @@ jobs:
 
           # 3. 对比摘要
           if [ "$UPSTREAM_DIGEST" == "$LOCAL_LABEL" ]; then
-            echo "::notice::Image is up to date."
-            echo "build=false" >> $GITHUB_OUTPUT
-            exit 0
+            if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+              echo "::notice::Manual trigger detected. Forcing build regardless of digest match."
+            else
+              echo "::notice::Image is up to date."
+              echo "build=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
           else
             echo "::notice::Update found ($UPSTREAM_DIGEST). Scanning for matching tags..."
-            echo "build=true" >> $GITHUB_OUTPUT
-            echo "digest=$UPSTREAM_DIGEST" >> $GITHUB_OUTPUT
           fi
 
+          echo "build=true" >> $GITHUB_OUTPUT
+          echo "digest=$UPSTREAM_DIGEST" >> $GITHUB_OUTPUT
+          
           # 4. 获取上游所有 Tags 并过滤 (排除 canary, beta 和 stable 本身)
           # grep -vE 'canary|beta|^stable$' : 排除包含canary/beta的tag, 以及精确匹配stable的tag
           ALL_TAGS=$(skopeo list-tags docker://${{ env.UPSTREAM_IMAGE }} | jq -r '.Tags[]' | grep -vE 'canary|beta|^stable$')
@@ -96,14 +101,22 @@ jobs:
 
       # --- 第二步：准备构建环境 ---
       - name: Prepare Build Context
+        env:
+          UPDATE_SH: ${{ secrets.UPDATE_SCRIPT }}
+          DOCKERFILE: ${{ secrets.DOCKERFILE_CONTENT }}
+          ORIGIN_DATA: ${{ secrets.ORIGIN_DATA }}
+          CUSTOM_DATA: ${{ secrets.CUSTOM_DATA }}
         if: steps.check.outputs.build == 'true'
         run: |
-          # 1. 恢复补丁脚本
-          echo "${{ secrets.UPDATE_SCRIPT }}" > update.sh
+          # 1. 恢复更新脚本
+          python -c "import os; open('update.sh', 'w').write(os.environ.get('UPDATE_SH', ''))"
           chmod +x update.sh
-          
-          # 2. 恢复 Dockerfile
-          echo "${{ secrets.DOCKERFILE_CONTENT }}" > Dockerfile
+          # 2. 准备 Dockerfile
+          python -c "import os; open('Dockerfile', 'w').write(os.environ.get('DOCKERFILE', ''))"
+          # 3. 准备 ORIGIN_DATA
+          python -c "import os; open('origin_data', 'w').write(os.environ.get('ORIGIN_DATA', ''))"
+          # 4. 准备 CUSTOM_DATA
+          python -c "import os; open('custom_data', 'w').write(os.environ.get('CUSTOM_DATA', ''))"
           
           echo "Build context prepared. Dockerfile and update.sh hidden from logs."
 
@@ -116,8 +129,6 @@ jobs:
           # 这样可以保持 Dockerfile Secret 的静态性
           # --label upstream_digest 注入 Digest 标记 (Metadata)
           docker build \
-            --build-arg ORIGINAL_PUBLIC_KEY="${{ secrets.ORIGINAL_PUBLIC_KEY }}" \
-            --build-arg CUSTOM_PUBLIC_KEY="${{ secrets.CUSTOM_PUBLIC_KEY }}" \
             --label upstream_digest="${{ steps.check.outputs.digest }}" \
             -t temp-affine:latest .
 
